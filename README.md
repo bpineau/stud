@@ -96,6 +96,8 @@ Detail about the entire set of options can be found by invoking `stud -h`:
     Performance:
       -n CORES                 number of worker processes (default is 1)
       -B BACKLOG               set listen backlog size (default is 100)
+      -e ENGINE                select OpenSSL hardware acceleration engine
+                               (default is 'any'); use 'none' to disable engines
 
     Security:
       -r PATH                  chroot

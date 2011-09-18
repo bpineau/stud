@@ -52,6 +52,7 @@
 #include <openssl/x509.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/engine.h>
 #include <ev.h>
 
 #include "ringbuffer.h"
@@ -98,6 +99,7 @@ typedef struct stud_options {
 #endif
     int QUIET;
     int SYSLOG;
+    const char *ENGINE;
 } stud_options;
 
 static stud_options OPTIONS = {
@@ -119,7 +121,8 @@ static stud_options OPTIONS = {
     0,            // SHARED_CACHE
 #endif
     0,             // QUIET
-    0             // SYSLOG    
+    0,            // SYSLOG
+    "any"         // ENGINE
 };
 
 
@@ -216,6 +219,34 @@ static int init_dh(SSL_CTX *ctx, const char *cert) {
 }
 #endif /* OPENSSL_NO_DH */
 
+/* Initialize hardware crypto engines. */
+static void init_engine(const char *egname) {
+    ENGINE *engine;
+    ENGINE_load_builtin_engines();
+
+    if (strcmp(egname, "any") == 0) {
+        ENGINE_register_all_complete();
+        return;
+    }
+
+    if (!(engine = ENGINE_by_id(egname))) {
+        ERR("{core} No %s engine available. Ignoring.\n", egname);
+        return;
+    }
+
+    if (!ENGINE_init(engine)) {
+        ERR("{core} Failed to initialize engine %s. Ignoring.\n", egname);
+        ENGINE_free(engine);
+        return;
+    }
+
+    if (!(ENGINE_set_default(engine, ENGINE_METHOD_ALL)))
+        ERR("{core} Failed to set default %s engine. Ignoring.\n", egname);
+
+    ENGINE_finish(engine);
+    ENGINE_free(engine);
+}
+
 /* Init library and load specified certificate.
  * Establishes a SSL_ctx, to act as a template for
  * each connection */
@@ -225,6 +256,9 @@ static SSL_CTX * init_openssl() {
     SSL_CTX *ctx = NULL;
     long ssloptions = SSL_OP_NO_SSLv2 | SSL_OP_ALL | 
             SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION;
+
+    if (strcmp(OPTIONS.ENGINE, "none"))
+        init_engine(OPTIONS.ENGINE);
 
     if (OPTIONS.ETYPE == ENC_TLS)
         ctx = SSL_CTX_new(TLSv1_server_method());
@@ -822,6 +856,8 @@ static void usage_fail(const char *prog, const char *msg) {
 #ifdef USE_SHARED_CACHE
 "  -C SHARED_CACHE          set shared cache size in sessions (default no shared cache)\n"
 #endif
+"  -e ENGINE                select OpenSSL hardware acceleration engine\n"
+"                           (default is 'any'); use 'none' to disable engines\n"
 "\n"
 "Security:\n"
 "  -r PATH                  chroot\n"
@@ -891,7 +927,7 @@ static void parse_cli(int argc, char **argv) {
 
     while (1) {
         int option_index = 0;
-        c = getopt_long(argc, argv, "hf:b:n:c:u:r:B:C:q:s",
+        c = getopt_long(argc, argv, "hf:b:n:c:u:r:B:e:C:q:s",
                 long_options, &option_index);
 
         if (c == -1)
@@ -963,6 +999,10 @@ static void parse_cli(int argc, char **argv) {
             }
             break;
 #endif
+
+        case 'e':
+            OPTIONS.ENGINE = optarg;
+            break;
 
         case 'q':
             OPTIONS.QUIET = 1;
