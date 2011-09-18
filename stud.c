@@ -33,6 +33,7 @@
 #include <netdb.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +45,7 @@
 #include <getopt.h>
 #include <pwd.h>
 #include <limits.h>
+#include <syslog.h>
 
 #include <sched.h>
 
@@ -95,6 +97,7 @@ typedef struct stud_options {
     int SHARED_CACHE;
 #endif
     int QUIET;
+    int SYSLOG;
 } stud_options;
 
 static stud_options OPTIONS = {
@@ -115,7 +118,8 @@ static stud_options OPTIONS = {
 #ifdef USE_SHARED_CACHE
     0,            // SHARED_CACHE
 #endif
-    0             // QUIET
+    0,             // QUIET
+    0             // SYSLOG    
 };
 
 
@@ -171,11 +175,17 @@ static void fail(const char* s) {
     exit(1);
 }
 
-#define LOG(...) \
-    do { if (!OPTIONS.QUIET) fprintf(stdout, __VA_ARGS__); } while(0)
+#define LOG(...)                                        \
+    do {                                                \
+      if (!OPTIONS.QUIET) fprintf(stdout, __VA_ARGS__); \
+      if (OPTIONS.SYSLOG) syslog(LOG_INFO, __VA_ARGS__);                    \
+    } while(0)
 
-#define ERR(...) \
-    do { fprintf(stderr, __VA_ARGS__); } while(0)
+#define ERR(...)                    \
+    do {                            \
+      fprintf(stderr, __VA_ARGS__); \
+      if (OPTIONS.SYSLOG) syslog(LOG_ERR, __VA_ARGS__); \
+    } while(0)
 
 #ifndef OPENSSL_NO_DH
 static int init_dh(SSL_CTX *ctx, const char *cert) {
@@ -312,6 +322,11 @@ static int create_main_socket() {
     if (bind(s, ai->ai_addr, ai->ai_addrlen)) {
         fail("{bind-socket}");
     }
+
+#if TCP_DEFER_ACCEPT
+    int timeout = 1; 
+    setsockopt(s, IPPROTO_TCP, TCP_DEFER_ACCEPT, &timeout, sizeof(int) );
+#endif /* TCP_DEFER_ACCEPT */
 
     prepare_proxy_line(ai->ai_addr);
 
@@ -676,6 +691,19 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
         return;
     }
 
+    int flag = 1;
+    int ret = setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag) );
+    if (ret == -1) {
+      perror("Couldn't setsockopt(TCP_NODELAY)\n");
+    }
+#ifdef TCP_CWND
+    int cwnd = 10;
+    ret = setsockopt(client, IPPROTO_TCP, TCP_CWND, &cwnd, sizeof(cwnd));
+    if (ret == -1) {
+      perror("Couldn't setsockopt(TCP_CWND)\n");
+    }
+#endif
+
     setnonblocking(client);
     int back = create_back_socket();
 
@@ -687,11 +715,11 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
 
     SSL_CTX * ctx = (SSL_CTX *)w->data;
     SSL *ssl = SSL_new(ctx);
+    long mode = SSL_MODE_ENABLE_PARTIAL_WRITE;
 #ifdef SSL_MODE_RELEASE_BUFFERS
-    SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_RELEASE_BUFFERS);
-#else
-    SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
+    mode |= SSL_MODE_RELEASE_BUFFERS;
 #endif
+    SSL_set_mode(ssl, mode);
     SSL_set_accept_state(ssl);
     SSL_set_fd(ssl, client);
 
@@ -775,42 +803,40 @@ static void handle_connections(SSL_CTX *ctx) {
 /* Print usage w/error message and exit failure */
 static void usage_fail(const char *prog, const char *msg) {
     if (msg)
-        ERR("%s: %s\n", prog, msg);
-    ERR("usage: %s [OPTION] PEM\n", prog);
+        fprintf(stderr, "%s: %s\n", prog, msg);
+    fprintf(stderr, "usage: %s [OPTION] PEM\n", prog);
 
-    ERR(
+    fprintf(stderr,
 "Encryption Methods:\n"
-"  --tls                    (TLSv1, default)\n"
-"  --ssl                    (SSLv3)\n"
-"  -c CIPHER_SUITE          (set allowed ciphers)\n"
+"  --tls                    TLSv1 (default)\n"
+"  --ssl                    SSLv3 (implies no TLSv1)\n"
+"  -c CIPHER_SUITE          set allowed ciphers (default is OpenSSL defaults)\n"
 "\n"
 "Socket:\n"
-"  -b HOST,PORT             (backend [connect], default \"127.0.0.1,8000\")\n"
-"  -f HOST,PORT             (frontend [bind], default \"*,8443\")\n"
+"  -b HOST,PORT             backend [connect] (default is \"127.0.0.1,8000\")\n"
+"  -f HOST,PORT             frontend [bind] (default is \"*,8443\")\n"
 "\n"
 "Performance:\n"
-"  -n CORES                 (number of worker processes, default 1)\n"
-"  -B BACKLOG               (set listen backlog size, default 100)\n"
+"  -n CORES                 number of worker processes (default is 1)\n"
+"  -B BACKLOG               set listen backlog size (default is 100)\n"
 #ifdef USE_SHARED_CACHE
-"  -C SHARED_CACHE          (set shared cache size in sessions, by default no shared cache)\n"
+"  -C SHARED_CACHE          set shared cache size in sessions (default no shared cache)\n"
 #endif
 "\n"
 "Security:\n"
-"  -r PATH                  (chroot)\n"
-"  -u USERNAME              (set gid/uid after binding the socket)\n"
+"  -r PATH                  chroot\n"
+"  -u USERNAME              set gid/uid after binding the socket\n"
 "\n"
 "Logging:\n"
-"  -q                       Be quiet. Emit only error messages\n"
+"  -q                       be quiet; emit only error messages\n"
+"  -s                       send log message to syslog in addition to stderr/stdout\n"
 "\n"
 "Special:\n"
-"  --write-ip               (write 1 octet with the IP family followed by\n"
-"                            4 (IPv4) or 16 (IPv6) octets little-endian\n"
-"                            to backend before the actual data)\n"
-"  --write-proxy            (write HaProxy's PROXY protocol line before actual data:\n"
-"                            \"PROXY TCP[64] <source-ip> <dest-ip> <source-port> <dest-port>\\r\\n\"\n"
-"                            Note, that dest-ip and dest-port are initialized once after the socket\n"
-"                            is bound. This means that you will get 0.0.0.0 as dest-ip instead of \n"
-"                            actual IP if that what the listening socket was bound to)\n"
+"  --write-ip               write 1 octet with the IP family followed by the IP\n"
+"                           address in 4 (IPv4) or 16 (IPv6) octets little-endian\n"
+"                           to backend before the actual data\n"
+"  --write-proxy            write HaProxy's PROXY (IPv4 or IPv6) protocol line\n" 
+"                           before actual data\n"
 );
     exit(1);
 }
@@ -865,7 +891,7 @@ static void parse_cli(int argc, char **argv) {
 
     while (1) {
         int option_index = 0;
-        c = getopt_long(argc, argv, "hf:b:n:c:u:r:B:C:q",
+        c = getopt_long(argc, argv, "hf:b:n:c:u:r:B:C:q:s",
                 long_options, &option_index);
 
         if (c == -1)
@@ -941,7 +967,11 @@ static void parse_cli(int argc, char **argv) {
         case 'q':
             OPTIONS.QUIET = 1;
             break;
-
+        
+        case 's':
+            OPTIONS.SYSLOG = 1;
+            break;
+            
         default:
             usage_fail(prog, NULL);
         }
@@ -986,7 +1016,11 @@ void drop_privileges() {
  * spawn child (worker) processes, and wait for them all to die
  * (which they shouldn't!) */
 int main(int argc, char **argv) {
+
     parse_cli(argc, argv);
+
+    if (OPTIONS.SYSLOG)
+        openlog("stud", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_DAEMON);
 
     signal(SIGPIPE, SIG_IGN);
 
